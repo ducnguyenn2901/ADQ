@@ -270,5 +270,5 @@ ADQ/
 ---
 
 **Version:** 2.0 (Enterprise Grid Architecture)  
-**Author:** Nguyễn Kiến Quốc  
+**Author:** ATTACKER_ADQ 
 **License:** MIT License

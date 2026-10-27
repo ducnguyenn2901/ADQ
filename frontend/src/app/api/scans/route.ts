@@ -1,0 +1,243 @@
+import { NextResponse } from "next/server";
+import { getPrismaClient } from "@/lib/prisma";
+import { getAuthenticatedUserFromRequest, syncAdminUserFromAuthUser } from "@/lib/admin";
+import { createSupabaseServerClient } from "@/lib/supabase/server";
+
+export const runtime = "nodejs";
+
+function normalizeDomain(input: string) {
+  return input.trim().replace(/^https?:\/\//, "").split("/")[0];
+}
+
+export async function GET(request: Request) {
+  const traceId = `tr_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const traceHeaders = {
+    "X-ADQ-Trace-Id": traceId,
+    "X-ADQ-Handler": "scans-list",
+    "X-ADQ-Build": process.env.NEXT_PUBLIC_APP_VERSION || "2.0.0",
+  };
+
+  const authUser = await getAuthenticatedUserFromRequest(request);
+  if (!authUser) {
+    console.log(`trace=${traceId} route=scans auth=no status=401 result=UNAUTHORIZED`);
+    return NextResponse.json({ ok: false, error: "UNAUTHORIZED" }, { status: 401, headers: traceHeaders });
+  }
+
+  const prisma = getPrismaClient();
+  const { getUserAuthorizedDomains } = await import("@/lib/tenant-isolation");
+  const authorizedDomains = await getUserAuthorizedDomains(authUser);
+
+  if (authorizedDomains.length === 0) {
+    console.log(`trace=${traceId} route=scans auth=yes user_id=${authUser.id} authorized_domains=0 db_count=0 returned=0 status=200`);
+    return NextResponse.json({ ok: true, scans: [] }, { headers: traceHeaders });
+  }
+
+  const jobs = await prisma.scanJob.findMany({
+    where: {
+      targetDomain: { in: authorizedDomains },
+    },
+    orderBy: { createdAt: "desc" },
+    take: 50,
+    include: {
+      liveHosts: { orderBy: { createdAt: "desc" }, take: 200 },
+      vulnerabilities: { orderBy: { createdAt: "desc" }, take: 500 },
+    },
+  });
+
+  console.log(`trace=${traceId} route=scans auth=yes db_count=${jobs.length} returned=${jobs.length} status=200`);
+  return NextResponse.json(
+    {
+      ok: true,
+      scans: jobs.map((job) => ({
+      id: job.scanId,
+      target: job.targetDomain,
+      status: job.status,
+      planUsed: "PRO",
+      startedAt: (job.startedAt ?? job.createdAt).toISOString(),
+      liveSubdomains: job.liveHosts
+        .map((host) => ({
+          host: host.url ?? job.targetDomain,
+          ip: "",
+          status: "LIVE",
+          tech: host.tech ?? "Unknown",
+        }))
+        .slice(0, 40),
+      portScan: [],
+      urlHistory: [],
+      secretsHunter: [],
+      vulnerabilities: job.vulnerabilities.map((v) => ({
+        id: String(v.id),
+        title: v.templateId || v.source,
+        severity: (v.severity ?? "LOW").toUpperCase(),
+        cvss: 0,
+        endpoint: v.endpoint ?? "",
+        asset: v.host ?? job.targetDomain,
+        description: v.matched ?? "",
+        exploitability: 0,
+        impact: v.raw ?? "",
+      })),
+      actionAdvice: [],
+      enabledTools: ["Subfinder", "DNSX", "Naabu", "Katana", "GAU", "Nuclei"],
+      autoThrottle: true,
+      telegram: { enabled: false },
+    })),
+  },
+  { headers: traceHeaders });
+}
+
+export async function POST(req: Request) {
+  const traceId = `tr_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const traceHeaders = {
+    "X-ADQ-Trace-Id": traceId,
+    "X-ADQ-Handler": "scans-create",
+    "X-ADQ-Build": process.env.NEXT_PUBLIC_APP_VERSION || "2.0.0",
+  };
+
+  const authUser = await getAuthenticatedUserFromRequest(req);
+  if (!authUser) {
+    console.log(`trace=${traceId} route=scans_create auth=no status=401 result=UNAUTHORIZED`);
+    return NextResponse.json({ ok: false, error: "UNAUTHORIZED" }, { status: 401, headers: traceHeaders });
+  }
+
+  const prisma = getPrismaClient();
+  const body = await req.json().catch(() => null);
+
+  const target = typeof body?.target === "string" ? normalizeDomain(body.target) : "";
+  const priorityScore = typeof body?.priority === "number" ? body.priority : 10;
+
+  if (!target) {
+    return NextResponse.json({ ok: false, error: "Vui lòng nhập domain/website hợp lệ." }, { status: 400, headers: traceHeaders });
+  }
+
+  // 1. Lấy thông tin tài khoản người dùng từ DB
+  const userRecord = await syncAdminUserFromAuthUser(authUser);
+
+  let currentTier = userRecord.packageTier;
+  const isExpired = userRecord.planExpiresAt ? new Date(userRecord.planExpiresAt) < new Date() : false;
+
+  // Nếu gói trả phí (PRO, PRO_MAX) đã hết hạn 30 ngày -> hạ về FREE
+  if (currentTier !== "FREE" && isExpired) {
+    currentTier = "FREE";
+    await prisma.adminUser.update({
+      where: { id: userRecord.id },
+      data: { packageTier: "FREE", planExpiresAt: null },
+    });
+  }
+
+  // 2. Ràng buộc gói FREE: Đúng 2 lượt duy nhất không hồi lại
+  if (currentTier === "FREE") {
+    const totalScans = userRecord.scansToday ?? 0;
+    if (totalScans >= 2) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error: "Tài khoản Dùng Thử Miễn Phí đã sử dụng hết 2 lượt quét vĩnh viễn. Vui lòng nâng cấp lên gói PRO hoặc PRO MAX để quét không giới hạn.",
+          code: "FREE_TIER_LIMIT_REACHED",
+        },
+        { status: 403, headers: traceHeaders }
+      );
+    }
+  }
+
+  // 3. Khởi tạo Scan Job gắn liền với quyền sở hữu của người dùng
+  const userEmail = (authUser.email ?? "").toLowerCase().trim();
+  const userId = authUser.id;
+
+  const targetRecord = await prisma.target.upsert({
+    where: { domain: target },
+    update: { updatedAt: new Date() },
+    create: {
+      domain: target,
+      projectDetail: {
+        create: {
+          title: target,
+          module: "scan",
+          status: "ACTIVE",
+          summary: {
+            domain: target,
+            userEmail,
+            userId,
+          },
+        },
+      },
+    },
+  });
+
+  const scanId = `scan_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+
+  const scanJob = await prisma.scanJob.create({
+    data: {
+      scanId,
+      targetDomain: targetRecord.domain,
+      status: "RUNNING",
+      startedAt: new Date(),
+      priorityScore,
+    },
+  });
+
+  // 4. Tăng số lượt quét đã dùng của người dùng
+  await prisma.adminUser.update({
+    where: { id: userRecord.id },
+    data: {
+      scansToday: { increment: 1 },
+    },
+  });
+
+  // Gửi lệnh sang SOC Engine Python với JWT của chính user.
+  // Backend cần token này để xác thực và enforce entitlement.
+  const backendUrl =
+    process.env.BACKEND_API_URL ||
+    process.env.NEXT_PUBLIC_API_URL ||
+    "http://127.0.0.1:8000";
+
+  try {
+    const authHeader = req.headers.get("authorization") || req.headers.get("Authorization");
+    let token = authHeader?.startsWith("Bearer ") ? authHeader.split(" ")[1] : undefined;
+    if (!token) {
+      try {
+        const supabase = await createSupabaseServerClient();
+        const {
+          data: { session },
+        } = await supabase.auth.getSession();
+        token = session?.access_token;
+      } catch {}
+    }
+
+    const backendResponse = await fetch(`${backendUrl}/api/scan`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+      body: JSON.stringify({
+        target,
+        no_telegram: true,
+        logic_scan: false,
+      }),
+    });
+
+    if (!backendResponse.ok) {
+      const backendError = await backendResponse.text().catch(() => "");
+      console.error(
+        `[scan] Backend rejected request (${backendResponse.status}):`,
+        backendError.slice(0, 500)
+      );
+    }
+  } catch (backendError) {
+    console.error("[scan] Backend dispatch failed:", backendError);
+  }
+
+  console.log(`trace=${traceId} route=scans_create auth=yes scan_id=${scanJob.scanId} target=${scanJob.targetDomain} status=200`);
+  return NextResponse.json(
+    {
+      ok: true,
+      scan: {
+        id: scanJob.scanId,
+        target: scanJob.targetDomain,
+        status: scanJob.status,
+        startedAt: scanJob.startedAt?.toISOString() ?? scanJob.createdAt.toISOString(),
+      },
+    },
+    { headers: traceHeaders }
+  );
+}

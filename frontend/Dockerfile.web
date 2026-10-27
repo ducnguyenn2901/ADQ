@@ -1,0 +1,48 @@
+# File: web/Dockerfile.web
+FROM node:20-alpine AS builder
+
+# Cài đặt OpenSSL và libc tương thích cho Prisma Engine trên Alpine
+RUN apk add --no-cache openssl libc6-compat
+
+WORKDIR /app
+COPY package*.json ./
+COPY prisma ./prisma/
+
+# Cài đặt dependencies và generate Prisma Client
+RUN npm ci || npm install
+RUN npx prisma generate
+
+# Copy toàn bộ source code web
+COPY . .
+
+# Build arguments
+ARG DATABASE_URL="postgresql://postgres:adq_secure_password@db:5432/adq_db"
+ARG NEXT_PUBLIC_API_URL="https://api.adq.io.vn"
+ARG NEXT_PUBLIC_SITE_URL="https://adq.io.vn"
+ARG NEXT_PUBLIC_SUPABASE_URL="https://placeholder.supabase.co"
+ARG NEXT_PUBLIC_SUPABASE_ANON_KEY="placeholder"
+ENV DATABASE_URL=${DATABASE_URL}
+ENV NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}
+ENV NEXT_PUBLIC_SITE_URL=${NEXT_PUBLIC_SITE_URL}
+ENV NEXT_PUBLIC_SUPABASE_URL=${NEXT_PUBLIC_SUPABASE_URL}
+ENV NEXT_PUBLIC_SUPABASE_ANON_KEY=${NEXT_PUBLIC_SUPABASE_ANON_KEY}
+
+# Build Next.js app
+RUN npm run build
+
+FROM node:20-alpine AS runner
+# Cài đặt OpenSSL ở runtime để chạy lệnh npx prisma db push
+RUN apk add --no-cache openssl libc6-compat
+
+WORKDIR /app
+
+COPY --from=builder /app/node_modules ./node_modules
+COPY --from=builder /app/.next ./.next
+COPY --from=builder /app/public ./public
+COPY --from=builder /app/package.json ./package.json
+COPY --from=builder /app/prisma ./prisma
+COPY --from=builder /app/scripts ./scripts
+
+EXPOSE 3000
+
+CMD ["sh", "-c", "npx prisma db push --accept-data-loss && npm run start"]

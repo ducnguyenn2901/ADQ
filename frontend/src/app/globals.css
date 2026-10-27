@@ -1,0 +1,203 @@
+@import "tailwindcss";
+
+:root {
+  --background: #000000;
+  --background-elevated: #0a0a0a;
+  --background-muted: #111111;
+  --background-strong: #171717;
+  --foreground: #ededed;
+  --foreground-soft: #a1a1a1;
+  --foreground-muted: #666666;
+  --line: #222222;
+  --line-strong: #333333;
+  --accent: #ffffff;
+  --accent-soft: rgba(255, 255, 255, 0.08);
+  --accent-strong: #ffffff;
+  --success-soft: rgba(16, 185, 129, 0.12);
+  --warning-soft: rgba(245, 158, 11, 0.12);
+  --danger-soft: rgba(244, 63, 94, 0.12);
+  --shadow-lg: 0 16px 40px rgba(0, 0, 0, 0.8);
+  --cyan-glow: rgba(255, 255, 255, 0.1);
+  --green-glow: rgba(16, 185, 129, 0.12);
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  color-scheme: dark;
+  scroll-behavior: smooth;
+  background: var(--background);
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-geist-sans), Arial, Helvetica, sans-serif;
+}
+
+body::selection {
+  background: #ffffff;
+  color: #000000;
+}
+
+/* ======================================================== */
+/* ADQ AUTHENTICATED APP — DARK-ONLY THEME SYSTEM           */
+/* ======================================================== */
+
+/* Active sidebar link: pure black text and icon on white bg */
+.active-sidebar-link {
+  background-color: #ffffff !important;
+  color: #000000 !important;
+  font-weight: 600 !important;
+}
+
+.active-sidebar-link *,
+.active-sidebar-link svg {
+  color: #000000 !important;
+  stroke: #000000 !important;
+  fill: none !important;
+}
+
+/* Active tool tab: pure black text and icon on white bg */
+.active-tool-tab {
+  background-color: #ffffff !important;
+  color: #000000 !important;
+  font-weight: 600 !important;
+}
+
+.active-tool-tab *,
+.active-tool-tab svg {
+  color: #000000 !important;
+  stroke: #000000 !important;
+  fill: none !important;
+}
+
+/* Tool sticky header */
+.tool-sticky-header {
+  background-color: rgba(0, 0, 0, 0.85) !important;
+  border-color: #222222 !important;
+}
+
+/* Tool switcher bar */
+.tool-switcher-bar {
+  background-color: #0a0a0a !important;
+  border-color: #262626 !important;
+}
+
+.tool-back-btn {
+  background-color: #0a0a0a !important;
+  border-color: #262626 !important;
+  color: #ededed !important;
+}
+
+/* Native form controls & inputs dark styling */
+input:not([type="checkbox"]):not([type="radio"]),
+textarea,
+select {
+  color-scheme: dark;
+}
+
+/* Dark Autofill behavior */
+input:-webkit-autofill,
+input:-webkit-autofill:hover,
+input:-webkit-autofill:focus,
+textarea:-webkit-autofill,
+textarea:-webkit-autofill:hover,
+textarea:-webkit-autofill:focus,
+select:-webkit-autofill,
+select:-webkit-autofill:hover,
+select:-webkit-autofill:focus {
+  -webkit-text-fill-color: #ededed !important;
+  -webkit-box-shadow: 0 0 0px 1000px #0a0a0a inset !important;
+  box-shadow: 0 0 0px 1000px #0a0a0a inset !important;
+  transition: background-color 5000s ease-in-out 0s;
+}
+
+
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+/* Ẩn hoàn toàn thanh cuộn cũ của trình duyệt */
+::-webkit-scrollbar {
+  display: none;
+  width: 0px;
+  height: 0px;
+}
+
+html,
+body {
+  scrollbar-width: none; /* Firefox */
+  -ms-overflow-style: none; /* IE / Edge */
+}
+
+.app-background {
+  background:
+    radial-gradient(circle at top, color-mix(in srgb, var(--accent) 16%, transparent), transparent 32%),
+    linear-gradient(180deg, var(--background) 0%, color-mix(in srgb, var(--background-muted) 75%, var(--background) 25%) 60%, var(--background) 100%);
+}
+
+.app-panel {
+  background: color-mix(in srgb, var(--background-elevated) 92%, transparent);
+  border: 1px solid var(--line);
+  box-shadow: var(--shadow-lg);
+}
+
+.app-panel-soft {
+  background: color-mix(in srgb, var(--background-muted) 86%, transparent);
+  border: 1px solid var(--line);
+}
+
+.app-pill {
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+}
+
+.app-text-muted {
+  color: var(--foreground-muted);
+}
+
+.app-text-soft {
+  color: var(--foreground-soft);
+}
+
+.app-border {
+  border-color: var(--line);
+}
+
+.app-border-strong {
+  border-color: var(--line-strong);
+}
+
+.cyber-grid {
+  background-image:
+    linear-gradient(color-mix(in srgb, var(--accent) 10%, transparent) 1px, transparent 1px),
+    linear-gradient(90deg, color-mix(in srgb, var(--accent) 10%, transparent) 1px, transparent 1px);
+  background-position: center;
+  background-size: 28px 28px;
+}
+
+.glass-panel {
+  background: linear-gradient(180deg, color-mix(in srgb, var(--background-elevated) 90%, transparent), color-mix(in srgb, var(--background) 94%, transparent));
+  border: 1px solid var(--line);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 8%, transparent), var(--shadow-lg);
+}
+
+.glow-cyan {
+  box-shadow: 0 0 0 1px rgba(6, 182, 212, 0.14), 0 0 32px var(--cyan-glow);
+}
+
+.glow-green {
+  box-shadow: 0 0 0 1px rgba(16, 185, 129, 0.14), 0 0 30px var(--green-glow);
+}

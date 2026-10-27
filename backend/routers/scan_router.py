@@ -1,0 +1,831 @@
+from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import StreamingResponse
+import json
+from pydantic import BaseModel
+from typing import Dict, Any, Optional
+from datetime import datetime, date, timezone
+
+from backend.schemas.scan import (
+    ScanRequest,
+    ScanResponse,
+    CopilotChatRequest,
+    StressRequest,
+    VerifyBypassRequest,
+    WafDetectRequest,
+    StressVerificationRequest,
+)
+from backend.services.scan_service import ScanService, redis_client
+from backend.core.stress_test.stress_orchestrator import StressOrchestrator
+from backend.core.auth import get_current_user
+from backend.core.security.ssrf_guard import resolve_and_validate_target
+from backend.core.security.stress_governor import (
+    validate_stress_runtime_limits,
+    parse_duration_sec,
+    StressSlotGovernor,
+    STRESS_TIER_LIMITS,
+    MAX_CONCURRENT_GLOBAL,
+)
+
+router = APIRouter(prefix="/api", tags=["Scans & Copilot"])
+
+from datetime import timedelta
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    ZoneInfo = None  # type: ignore
+
+# Kept for compatibility shim, but quota authority is strictly Redis
+USAGE_TRACKER: Dict[str, Dict[str, Any]] = {}
+
+def get_vietnam_now() -> datetime:
+    """Returns current datetime in Asia/Ho_Chi_Minh timezone."""
+    if ZoneInfo:
+        return datetime.now(ZoneInfo("Asia/Ho_Chi_Minh"))
+    return datetime.now(timezone(timedelta(hours=7)))
+
+def get_seconds_until_vietnam_midnight() -> int:
+    """Calculates seconds until 00:00 Asia/Ho_Chi_Minh of next day + 3600s buffer."""
+    now = get_vietnam_now()
+    tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    seconds = int((tomorrow - now).total_seconds())
+    return max(3600, seconds + 3600)
+
+def get_user_usage(user_id: str) -> Dict[str, Any]:
+    """
+    Authoritative Daily Quota Tracker in Redis.
+    Fail-closed: If Redis is unavailable, raises 503 QUOTA_SERVICE_UNAVAILABLE.
+    """
+    today = get_vietnam_now().strftime("%Y-%m-%d")
+    if not redis_client:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="QUOTA_SERVICE_UNAVAILABLE: Chưa thể kiểm tra lượt Stress Test lúc này. Hãy thử lại sau."
+        )
+    try:
+        r_key = f"user_usage:{user_id}:{today}"
+        raw = redis_client.get(r_key)
+        if raw:
+            return json.loads(raw)
+        return {
+            "date": today,
+            "scans_count": 0,
+            "stress_count": 0,
+            "total_lifetime_scans": 0,
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"QUOTA_SERVICE_UNAVAILABLE: Lỗi kết nối máy chủ hạn mức ({str(exc)})."
+        )
+
+
+def record_user_usage_increment(user_id: str, field: str = "stress_count") -> Dict[str, Any]:
+    """
+    Authoritatively increments daily usage counter in Redis with Vietnam midnight TTL.
+    Fail-closed: If Redis is unavailable, raises 503 QUOTA_SERVICE_UNAVAILABLE.
+    """
+    today = get_vietnam_now().strftime("%Y-%m-%d")
+    if not redis_client:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="QUOTA_SERVICE_UNAVAILABLE: Chưa thể ghi nhận lượt Stress Test lúc này. Hãy thử lại sau."
+        )
+    try:
+        usage = get_user_usage(user_id)
+        usage[field] = usage.get(field, 0) + 1
+        r_key = f"user_usage:{user_id}:{today}"
+        ttl = get_seconds_until_vietnam_midnight()
+        redis_client.set(r_key, json.dumps(usage), ex=ttl)
+        return usage
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"QUOTA_SERVICE_UNAVAILABLE: Lỗi lưu trữ hạn mức ({str(exc)})."
+        )
+
+
+
+def parse_iso_datetime(value: Any) -> Optional[datetime]:
+    """
+    Chuyển đổi chuỗi ISO timestamp thành datetime có timezone UTC an toàn.
+    """
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(value, tz=timezone.utc)
+        except Exception:
+            return None
+    if isinstance(value, str):
+        val = value.strip()
+        if not val:
+            return None
+        try:
+            # Chuẩn hóa ký tự Z thành +00:00 cho tương thích
+            dt = datetime.fromisoformat(val.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        except Exception:
+            return None
+    return None
+
+
+def get_effective_user_tier(user: Dict[str, Any]) -> str:
+    """
+    Authoritative Effective Package Tier Resolver.
+
+    1. Trích xuất raw package tier từ app_metadata (vùng server-managed) hoặc user root.
+    2. Nếu tier là FREE: luôn giữ FREE.
+    3. Nếu tier là PRO hoặc PRO_MAX:
+       - Trích xuất planExpiresAt từ app_metadata, user hoặc user_metadata.
+       - Nếu có planExpiresAt: parse ISO timestamp và so sánh với datetime.now(timezone.utc).
+         + Nếu đã hết hạn (planExpiresAt <= now): Tự động hạ về FREE (Fail-closed).
+         + Nếu chuỗi expiry bị malformed/không thể parse: Fail-closed hạ về FREE.
+         + Nếu còn hạn: Giữ nguyên PRO / PRO_MAX.
+       - Nếu không có planExpiresAt (ví dụ gói vĩnh viễn hoặc dev mock): Giữ nguyên PRO / PRO_MAX.
+    """
+    app_metadata = user.get("app_metadata") or {}
+    user_metadata = user.get("user_metadata") or {}
+
+    raw_tier = (
+        app_metadata.get("packageTier")
+        or app_metadata.get("package_tier")
+        or user.get("packageTier")
+        or user.get("package_tier")
+        or user_metadata.get("packageTier")
+        or "FREE"
+    )
+
+    tier = str(raw_tier).strip().upper()
+    if tier not in {"PRO", "PRO_MAX"}:
+        return "FREE"
+
+    # Trích xuất hạn dùng planExpiresAt
+    raw_expiry = (
+        app_metadata.get("planExpiresAt")
+        or app_metadata.get("plan_expires_at")
+        or user.get("planExpiresAt")
+        or user.get("plan_expires_at")
+        or user_metadata.get("planExpiresAt")
+        or user_metadata.get("plan_expires_at")
+    )
+
+    if raw_expiry is not None:
+        if isinstance(raw_expiry, str) and not raw_expiry.strip():
+            # Chuỗi rỗng: không có hạn cụ thể
+            pass
+        else:
+            expiry_dt = parse_iso_datetime(raw_expiry)
+            if expiry_dt is None:
+                # Malformed timestamp string provided -> fail-closed về FREE
+                return "FREE"
+
+            now_utc = datetime.now(timezone.utc)
+            if expiry_dt <= now_utc:
+                return "FREE"
+
+    return tier
+
+
+def get_user_tier(user: Dict[str, Any]) -> str:
+    """
+    Resolver tương thích toàn cục gọi get_effective_user_tier.
+    """
+    return get_effective_user_tier(user)
+
+
+def enforce_stress_quota(user: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
+    user_id = str(user.get("id") or user.get("sub") or "anonymous")
+    tier = get_user_tier(user)
+    usage = get_user_usage(user_id)
+
+    if tier == "FREE":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="TIER_LOCKED: Gói FREE không hỗ trợ Stress Test."
+        )
+
+    limit = 1 if tier == "PRO" else 10
+
+    if usage.get("stress_count", 0) >= limit:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "DAILY_LIMIT: Gói PRO giới hạn 1 lượt Stress Test/ngày."
+                if tier == "PRO"
+                else "DAILY_LIMIT: Bạn đã sử dụng hết 10 lượt Stress Test trong ngày."
+            )
+        )
+
+    record_user_usage_increment(user_id, "stress_count")
+    return tier, get_user_usage(user_id)
+
+class EndpointDiscoveryRequest(BaseModel):
+    target_url: str
+
+class VerifyBypassRequest(BaseModel):
+    target_url: str
+    bypass_code: str
+    waf_type: Optional[str] = "standard"
+
+
+class CopilotAnalyzeRequest(BaseModel):
+    job_id: str
+
+
+class CopilotPatchRequest(BaseModel):
+    vulnerability_type: str
+    endpoint: str
+    framework: Optional[str] = "Next.js"
+
+@router.post("/scan", response_model=ScanResponse, status_code=status.HTTP_201_CREATED)
+def start_scan(req: ScanRequest, user: Dict[str, Any] = Depends(get_current_user)):
+    user_id = str(user.get("id") or user.get("sub") or "anonymous")
+    tier = get_user_tier(user)
+    usage = get_user_usage(user_id)
+
+    # 1. Gate 1: SSRF Target Validation & Canonicalization
+    origin, _ = resolve_and_validate_target(req.target)
+
+    # 2. Gate 2: Mandatory Ownership Verification Check
+    if not ScanService.is_target_verified(user, origin):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Mục tiêu chưa được xác minh quyền sở hữu qua Meta Tag. Vui lòng thêm thẻ meta vào <head> và bấm Xác minh trước khi thực hiện quét an ninh."
+        )
+
+    # 3. Kiểm tra giới hạn Quét DAST
+    if tier == "FREE":
+        if usage["total_lifetime_scans"] >= 2:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="LIMIT_REACHED: Bạn đã sử dụng hết 2 lượt quét miễn phí. Vui lòng nâng cấp gói PRO để quét không giới hạn."
+            )
+        usage["total_lifetime_scans"] += 1
+    
+    usage["scans_count"] += 1
+
+    # 4. Tạo job quét với canonical origin & user_id (Gói FREE: skip_ai = True để tiết kiệm 100% token)
+    skip_ai = (tier == "FREE")
+    job = ScanService.create_scan_job(req, canonical_target=origin, user_id=user_id, skip_ai=skip_ai)
+    
+    return ScanResponse(
+        ok=True,
+        job_id=job["job_id"],
+        target=job["target"],
+        status=job["status"],
+        message="Scan job queued successfully" if not skip_ai else "Scan job queued (Free tier: AI Analysis skipped)",
+    )
+
+def authorize_scan_job_access(job: Optional[Dict[str, Any]], user: Dict[str, Any]) -> None:
+    if not job:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Scan job not found",
+        )
+    user_id = str(user.get("id") or user.get("sub") or "anonymous")
+    job_user_id = job.get("user_id")
+    if job_user_id and str(job_user_id) != user_id:
+        app_metadata = user.get("app_metadata") or {}
+        role = str(app_metadata.get("role") or user.get("role") or "").upper()
+        if role != "ADMIN":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Bạn không có quyền truy cập tiến trình quét này."
+            )
+
+
+@router.get("/scan/{job_id}/endpoints")
+def get_scan_endpoints_route(
+    job_id: str,
+    user: Dict[str, Any] = Depends(get_current_user),
+):
+    try:
+        from backend.core.engine.db import get_scan_endpoints
+    except ImportError:
+        from core.engine.db import get_scan_endpoints
+
+    job = ScanService.get_job_status(job_id)
+    authorize_scan_job_access(job, user)
+
+    endpoints = get_scan_endpoints(job_id)
+
+    return {
+        "ok": True,
+        "job_id": job_id,
+        "total": len(endpoints),
+        "endpoints": endpoints,
+    }
+
+
+@router.get("/scan/{job_id}")
+def get_scan_status(job_id: str, user: Dict[str, Any] = Depends(get_current_user)):
+    tier = get_user_tier(user)
+    job = ScanService.get_job_status(job_id, user_tier=tier)
+    authorize_scan_job_access(job, user)
+    
+    if job and isinstance(job, dict):
+        job = dict(job)
+        if isinstance(job.get("request"), dict):
+            from backend.schemas.scan import sanitize_request_data
+            job["request"] = sanitize_request_data(job["request"])
+        if tier == "FREE":
+            job["ai_locked"] = True
+            job["ai_summary"] = None
+    
+    return {"ok": True, "job": job}
+
+
+@router.get("/scan/{job_id}/assurance")
+def get_scan_assurance(job_id: str, user: Dict[str, Any] = Depends(get_current_user)):
+    tier = get_user_tier(user)
+    job = ScanService.get_job_status(job_id, user_tier=tier)
+    authorize_scan_job_access(job, user)
+    assurance = job.get("assurance_matrix")
+    if not assurance:
+        try:
+            try:
+                from backend.security_controls.assurance_engine import evaluate_scan_assurance
+            except ImportError:
+                from security_controls.assurance_engine import evaluate_scan_assurance
+            assurance = evaluate_scan_assurance(job, user_tier=tier)
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Assurance evaluation error: {exc}")
+
+    return {"ok": True, "job_id": job_id, "assurance": assurance}
+
+
+@router.post("/scan/{job_id}/ai-assessment")
+def get_or_generate_ai_assessment(
+    job_id: str,
+    user: Dict[str, Any] = Depends(get_current_user),
+):
+    tier = get_user_tier(user)
+    job = ScanService.get_job_status(job_id, user_tier=tier)
+    authorize_scan_job_access(job, user)
+    return ScanService.get_or_generate_scan_ai_assessment(job_id, user_tier=tier, force_refresh=True)
+
+
+@router.get("/scan/{job_id}/ai-assessment")
+def get_cached_ai_assessment(
+    job_id: str,
+    user: Dict[str, Any] = Depends(get_current_user),
+):
+    tier = get_user_tier(user)
+    job = ScanService.get_job_status(job_id, user_tier=tier)
+    authorize_scan_job_access(job, user)
+    return ScanService.get_or_generate_scan_ai_assessment(job_id, user_tier=tier, force_refresh=False)
+
+
+@router.post("/copilot/chat")
+def copilot_chat(req: CopilotChatRequest, user: Dict[str, Any] = Depends(get_current_user)):
+    tier = get_user_tier(user)
+    
+    # Chỉ gói PRO_MAX mới được tương tác Copilot Chat
+    if tier != "PRO_MAX":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="TIER_LOCKED: Tính năng tương tác trực tiếp với Agentic AI Copilot chỉ dành riêng cho gói PRO MAX."
+        )
+    user_id = str(user.get("id") or user.get("sub") or "anonymous")
+    res = ScanService.copilot_chat_interactive(
+        user_id=user_id,
+        prompt=req.prompt,
+        conv_id=req.conv_id,
+        scan_job_id=req.scan_job_id,
+        stress_job_id=req.stress_job_id,
+    )
+    return res
+
+@router.get("/copilot/conversations")
+def list_copilot_conversations(user: Dict[str, Any] = Depends(get_current_user)):
+    tier = get_user_tier(user)
+    if tier != "PRO_MAX":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="TIER_LOCKED: Yêu cầu gói PRO MAX.")
+    user_id = str(user.get("id") or user.get("sub") or "anonymous")
+    return {"ok": True, "conversations": ScanService.list_copilot_conversations(user_id)}
+
+@router.get("/copilot/conversations/{conv_id}")
+def get_copilot_conversation(conv_id: str, user: Dict[str, Any] = Depends(get_current_user)):
+    tier = get_user_tier(user)
+    if tier != "PRO_MAX":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="TIER_LOCKED: Yêu cầu gói PRO MAX.")
+    user_id = str(user.get("id") or user.get("sub") or "anonymous")
+    return {"ok": True, "conversation": ScanService.get_copilot_conversation(user_id, conv_id)}
+
+@router.delete("/copilot/conversations/{conv_id}")
+def delete_copilot_conversation(conv_id: str, user: Dict[str, Any] = Depends(get_current_user)):
+    tier = get_user_tier(user)
+    if tier != "PRO_MAX":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="TIER_LOCKED: Yêu cầu gói PRO MAX.")
+    user_id = str(user.get("id") or user.get("sub") or "anonymous")
+    success = ScanService.delete_copilot_conversation(user_id, conv_id)
+    return {"ok": success}
+
+@router.post("/copilot/analyze")
+def copilot_analyze(
+    req: CopilotAnalyzeRequest,
+    user: Dict[str, Any] = Depends(get_current_user),
+):
+    if get_user_tier(user) != "PRO_MAX":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="TIER_LOCKED: Copilot Analyze chỉ dành cho gói PRO MAX."
+        )
+
+    return ScanService.copilot_analyze(req.job_id)
+
+
+@router.post("/copilot/patch")
+def copilot_patch(
+    req: CopilotPatchRequest,
+    user: Dict[str, Any] = Depends(get_current_user),
+):
+    if get_user_tier(user) != "PRO_MAX":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="TIER_LOCKED: One-Click Patch chỉ dành cho gói PRO MAX."
+        )
+
+    return ScanService.copilot_patch(
+        vulnerability_type=req.vulnerability_type,
+        endpoint=req.endpoint,
+        framework=req.framework or "Next.js",
+    )
+
+
+@router.post("/stress/discover-endpoints")
+def discover_endpoints(req: EndpointDiscoveryRequest, user: Dict[str, Any] = Depends(get_current_user)):
+    tier = get_user_tier(user)
+    if tier == "FREE":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Gói FREE không hỗ trợ Stress Test.")
+    origin, _ = resolve_and_validate_target(req.target_url)
+    return ScanService.discover_endpoints(origin)
+
+@router.post("/stress/detect-waf")
+def detect_waf(req: WafDetectRequest, user: Dict[str, Any] = Depends(get_current_user)):
+    tier = get_user_tier(user)
+    if tier == "FREE":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Gói FREE không hỗ trợ Stress Test.")
+    return ScanService.detect_waf(req)
+
+@router.post("/verification/status")
+@router.get("/verification/status")
+@router.post("/scan/verification/status")
+@router.get("/scan/verification/status")
+def get_verification_status_route(
+    target_url: Optional[str] = None,
+    req: Optional[StressVerificationRequest] = None,
+    user: Dict[str, Any] = Depends(get_current_user),
+):
+    target = req.target_url if (req and req.target_url) else target_url
+    if not target:
+        raise HTTPException(status_code=400, detail="Missing target_url parameter.")
+    return ScanService.get_target_verification_status(user, target)
+
+@router.post("/verification/start")
+@router.post("/scan/verification/start")
+def start_verification_route(req: StressVerificationRequest, user: Dict[str, Any] = Depends(get_current_user)):
+    return ScanService.start_target_verification(user, req.target_url)
+
+@router.post("/verification/check")
+@router.post("/scan/verification/check")
+def check_verification_route(req: StressVerificationRequest, user: Dict[str, Any] = Depends(get_current_user)):
+    return ScanService.check_target_verification(user, req.target_url)
+
+@router.post("/stress/verification/start")
+def start_stress_verification(req: StressVerificationRequest, user: Dict[str, Any] = Depends(get_current_user)):
+    tier = get_user_tier(user)
+    if tier == "FREE":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Gói FREE không hỗ trợ Stress Test.")
+    return ScanService.start_stress_verification(user, req.target_url)
+
+@router.post("/stress/verification/check")
+def check_stress_verification(req: StressVerificationRequest, user: Dict[str, Any] = Depends(get_current_user)):
+    tier = get_user_tier(user)
+    if tier == "FREE":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Gói FREE không hỗ trợ Stress Test.")
+    return ScanService.check_stress_verification(user, req.target_url)
+
+@router.post("/stress/verify-bypass")
+def verify_bypass(req: VerifyBypassRequest, user: Dict[str, Any] = Depends(get_current_user)):
+    tier = get_user_tier(user)
+    if tier == "FREE":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Gói FREE không hỗ trợ Stress Test.")
+    origin, _ = resolve_and_validate_target(req.target_url)
+    orchestrator = StressOrchestrator()
+    return orchestrator.verify_bypass(target_url=origin, bypass_code=req.bypass_code, waf_type=req.waf_type or "standard")
+
+
+
+
+@router.get("/stress/endpoints")
+def get_stress_endpoints(target_url: str, user: Dict[str, Any] = Depends(get_current_user)):
+    """
+    Lightweight, non-destructive endpoint discovery for verified target.
+    Priority 1: Existing known Scan / Web Mapping data from DB.
+    Priority 2: Safe same-origin probe (/, robots.txt, sitemap.xml, safe paths).
+    """
+    tier = get_user_tier(user)
+    if tier == "FREE":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Gói FREE không hỗ trợ Stress Test.")
+
+    origin, resolved_ips = resolve_and_validate_target(target_url)
+
+    # Verify target ownership
+    if not ScanService.is_stress_target_verified(user, origin):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Mục tiêu chưa được xác minh quyền sở hữu qua Meta Tag."
+        )
+
+    endpoints = []
+    seen_paths = set()
+
+    def add_endpoint(path: str, status_code: int = 200, source: str = "discovery"):
+        clean_path = ("/" + str(path).strip().lstrip("/")).split("?")[0]
+        if clean_path not in seen_paths and len(clean_path) <= 256:
+            seen_paths.add(clean_path)
+            endpoints.append({
+                "method": "GET",
+                "path": clean_path,
+                "status": status_code,
+                "source": source
+            })
+
+    # Root endpoint is always available
+    add_endpoint("/", 200, source="root")
+
+    # 1. Query known Scan endpoints from PostgreSQL if present
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(origin)
+        domain = parsed.netloc.split(":")[0]
+
+        from backend.core.engine.db import get_engine
+        from sqlalchemy import text
+        engine = get_engine()
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text("""
+                    SELECT DISTINCT se.url, se.status_code
+                    FROM scan_endpoints se
+                    JOIN scan_jobs sj ON se.scan_id = sj.scan_id
+                    WHERE sj.target_domain = :domain
+                    ORDER BY se.url ASC LIMIT 50
+                """),
+                {"domain": domain}
+            ).mappings().all()
+            for r in rows:
+                raw_u = r.get("url") or ""
+                p = urlparse(raw_u).path
+                if p:
+                    add_endpoint(p, r.get("status_code") or 200, source="scan_mapping")
+    except Exception:
+        pass
+
+    # 2. If fewer than 4 endpoints, do safe lightweight probe on same origin
+    if len(endpoints) < 4:
+        try:
+            pinned_ip = resolved_ips[0]
+            from backend.core.security.ssrf_guard import is_dev_private_allowed
+            actual_verify = not is_dev_private_allowed()
+            orchestrator = StressOrchestrator()
+            s, _ = orchestrator._get_client_session({"User-Agent": "Mozilla/5.0 (ADQ-Discovery)"}, {}, pinned_ip=pinned_ip)
+
+            candidate_paths = ["/robots.txt", "/sitemap.xml", "/api", "/api/health", "/health", "/login", "/about", "/docs"]
+            for cpath in candidate_paths:
+                if len(endpoints) >= 15:
+                    break
+                try:
+                    target_probe = f"{origin}{cpath}"
+                    resp = s.get(target_probe, timeout=2.5, verify=actual_verify, allow_redirects=False)
+                    if resp.status_code in (200, 204, 301, 302, 304, 307, 308, 401, 403):
+                        add_endpoint(cpath, resp.status_code, source="lightweight_probe")
+
+                        # If robots.txt returned 200, parse Disallow / Allow paths
+                        if cpath == "/robots.txt" and resp.status_code == 200 and resp.text:
+                            for line in resp.text.splitlines()[:20]:
+                                line = line.strip()
+                                if line.lower().startswith(("disallow:", "allow:")):
+                                    parts = line.split(":", 1)
+                                    if len(parts) == 2:
+                                        rpath = parts[1].strip()
+                                        if rpath.startswith("/") and not any(ch in rpath for ch in "*$"):
+                                            add_endpoint(rpath, 200, source="robots_txt")
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+    return {"ok": True, "target": origin, "endpoints": endpoints}
+
+
+try:
+    from backend.services.stress_dispatch_service import StressDispatchService
+except ImportError:
+    from services.stress_dispatch_service import StressDispatchService
+
+@router.post("/stress/jobs", status_code=status.HTTP_202_ACCEPTED)
+def dispatch_stress_job(req: StressRequest, user: Dict[str, Any] = Depends(get_current_user)):
+    """
+    Phase 2B: Async stress job dispatch to dedicated worker queue.
+    """
+    res = StressDispatchService.enqueue_stress_job(req, user)
+    return res
+
+
+@router.get("/stress/user/history")
+@router.get("/stress/history")
+def get_stress_history(user: Dict[str, Any] = Depends(get_current_user)):
+    """Retrieves list of past stress test runs for authenticated user."""
+    user_id = str(user.get("id") or user.get("sub") or "anonymous")
+    return {"ok": True, "history": StressDispatchService.get_user_stress_history(user_id)}
+
+
+@router.get("/stress/{job_id}")
+def get_stress_job_snapshot(job_id: str, user: Dict[str, Any] = Depends(get_current_user)):
+    """
+    Retrieves the current public state snapshot of a stress job (0 secrets).
+    """
+    user_id = str(user.get("id") or user.get("sub") or "anonymous")
+    state = StressDispatchService.get_stress_job_state(job_id)
+    if not state:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Không tìm thấy tiến trình kiểm thử tải.")
+
+    # Multi-user authorization check
+    if str(state.get("user_id")) != user_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Bạn không có quyền truy cập tiến trình này.")
+
+    return state
+
+
+@router.post("/stress/{job_id}/stop")
+def stop_stress_job(job_id: str, user: Dict[str, Any] = Depends(get_current_user)):
+    """Gracefully stops an active or queued stress job."""
+    user_id = str(user.get("id") or user.get("sub") or "anonymous")
+    return StressDispatchService.stop_stress_job(job_id, user_id)
+
+
+import asyncio
+
+@router.get("/stress/{job_id}/stream")
+async def stream_stress_job_events(job_id: str, user: Dict[str, Any] = Depends(get_current_user)):
+    """
+    SSE relay with race-safe subscribe + snapshot-first + reconnect support.
+    Does NOT touch governor slots (managed independently by worker).
+    """
+    user_id = str(user.get("id") or user.get("sub") or "anonymous")
+    initial_check = StressDispatchService.get_stress_job_state(job_id)
+    if not initial_check:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Không tìm thấy tiến trình kiểm thử tải.")
+
+    if str(initial_check.get("user_id")) != user_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Bạn không có quyền truy cập tiến trình này.")
+
+    async def sse_relay():
+        pubsub = None
+        channel = f"stress_events:{job_id}"
+        if redis_client:
+            try:
+                pubsub = redis_client.pubsub()
+                pubsub.subscribe(channel)
+            except Exception:
+                pubsub = None
+
+        try:
+            # 1. Snapshot-first: Read current snapshot after subscription
+            snapshot = StressDispatchService.get_stress_job_state(job_id)
+            if snapshot:
+                yield f"data: {json.dumps(snapshot)}\n\n"
+                if snapshot.get("status") in ("COMPLETED", "FAILED"):
+                    return
+
+            # 2. Consume live events from Redis Pub/Sub with periodic snapshot check
+            while True:
+                has_msg = False
+                if pubsub:
+                    try:
+                        msg = pubsub.get_message(ignore_subscribe_messages=True, timeout=0.05)
+                        if msg and msg.get("type") == "message":
+                            data_str = msg.get("data")
+                            event_data = json.loads(data_str)
+                            yield f"data: {json.dumps(event_data)}\n\n"
+                            has_msg = True
+                            if event_data.get("status") in ("COMPLETED", "FAILED") or event_data.get("done"):
+                                break
+                    except Exception:
+                        pass
+
+                if not has_msg:
+                    cur_st = StressDispatchService.get_stress_job_state(job_id)
+                    if cur_st and cur_st.get("status") in ("COMPLETED", "FAILED"):
+                        yield f"data: {json.dumps(cur_st)}\n\n"
+                        break
+                    await asyncio.sleep(0.2)
+
+        finally:
+            if pubsub:
+                try:
+                    pubsub.unsubscribe(channel)
+                    pubsub.close()
+                except Exception:
+                    pass
+
+    return StreamingResponse(
+        sse_relay(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        }
+    )
+
+
+@router.get("/scan/{job_id}/stream")
+async def stream_scan_job_events(job_id: str, user: Dict[str, Any] = Depends(get_current_user)):
+    """
+    SSE relay for live scan pipeline progress, stage updates, and control assurance state.
+    """
+    tier = get_user_tier(user)
+    initial_check = ScanService.get_job_status(job_id, user_tier=tier)
+    authorize_scan_job_access(initial_check, user)
+
+    async def sse_scan_relay():
+        pubsub = None
+        channel = f"scan_events:{job_id}"
+        if redis_client:
+            try:
+                pubsub = redis_client.pubsub()
+                pubsub.subscribe(channel)
+            except Exception:
+                pubsub = None
+
+        try:
+            # 1. Snapshot-first: Read current snapshot after subscription
+            snapshot = ScanService.get_job_status(job_id, user_tier=tier)
+            if snapshot:
+                yield f"data: {json.dumps(snapshot, default=str)}\n\n"
+                if str(snapshot.get("status", "")).upper() in ("COMPLETED", "FAILED"):
+                    return
+
+            # 2. Consume live events from Redis Pub/Sub
+            while True:
+                has_msg = False
+                if pubsub:
+                    try:
+                        msg = pubsub.get_message(ignore_subscribe_messages=True, timeout=0.05)
+                        if msg and msg.get("type") == "message":
+                            data_str = msg.get("data")
+                            event_data = json.loads(data_str)
+                            # Augment event with assurance matrix
+                            try:
+                                try:
+                                    from backend.security_controls.assurance_engine import evaluate_scan_assurance
+                                except ImportError:
+                                    from security_controls.assurance_engine import evaluate_scan_assurance
+                                event_data["assurance_matrix"] = evaluate_scan_assurance(event_data, user_tier=tier)
+                            except Exception:
+                                pass
+                            yield f"data: {json.dumps(event_data, default=str)}\n\n"
+                            has_msg = True
+                            if str(event_data.get("status", "")).upper() in ("COMPLETED", "FAILED", "DONE"):
+                                break
+                    except Exception:
+                        pass
+
+                if not has_msg:
+                    cur_st = ScanService.get_job_status(job_id, user_tier=tier)
+                    if cur_st and str(cur_st.get("status", "")).upper() in ("COMPLETED", "FAILED"):
+                        yield f"data: {json.dumps(cur_st, default=str)}\n\n"
+                        break
+                    await asyncio.sleep(0.5)
+
+        finally:
+            if pubsub:
+                try:
+                    pubsub.unsubscribe(channel)
+                    pubsub.close()
+                except Exception:
+                    pass
+
+    return StreamingResponse(
+        sse_scan_relay(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        }
+    )
+

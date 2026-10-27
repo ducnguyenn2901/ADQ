@@ -1,0 +1,47 @@
+FROM python:3.11-slim
+
+RUN apt-get update && apt-get install -y \
+    wget curl git gcc make libpcap-dev golang-go netcat-openbsd \
+    default-jre-headless apktool unzip \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install JADX CLI Decompiler v1.5.0
+ENV JADX_VERSION=1.5.0
+RUN wget -q https://github.com/skylot/jadx/releases/download/v${JADX_VERSION}/jadx-${JADX_VERSION}.zip -O /tmp/jadx.zip \
+    && mkdir -p /opt/jadx \
+    && unzip -q /tmp/jadx.zip -d /opt/jadx \
+    && ln -s /opt/jadx/bin/jadx /usr/local/bin/jadx \
+    && rm /tmp/jadx.zip
+
+RUN mkdir -p /usr/share/seclists/Discovery/Web-Content && \
+    curl -sSL https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/common.txt -o /usr/share/seclists/Discovery/Web-Content/common.txt && \
+    curl -sSL https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/api-endpoints.txt -o /usr/share/seclists/Discovery/Web-Content/api-endpoints.txt
+
+ENV GOPATH=/root/go
+ENV PATH=$PATH:/usr/local/go/bin:$GOPATH/bin
+
+RUN go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest && \
+    go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest && \
+    mv $GOPATH/bin/httpx $GOPATH/bin/httpx-toolkit && \
+    go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest && \
+    go install -v github.com/projectdiscovery/naabu/v2/cmd/naabu@latest && \
+    go install -v github.com/projectdiscovery/katana/cmd/katana@latest && \
+    go install -v github.com/lc/gau/v2/cmd/gau@latest && \
+    go install -v github.com/projectdiscovery/dnsx/cmd/dnsx@latest && \
+    go install -v github.com/ffuf/ffuf/v2@latest && \
+    go install -v github.com/tomnomnom/waybackurls@latest && \
+    go install -v github.com/lc/subjs@latest && \
+    mv $GOPATH/bin/* /usr/local/bin/ && \
+    rm -rf /root/go/pkg /root/.cache/go-build
+
+WORKDIR /app
+
+ENV PYTHONPATH="/app"
+RUN ln -s /app /app/backend
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+CMD ["python3", "api_server.py"]

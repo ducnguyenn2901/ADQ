@@ -1,0 +1,495 @@
+import type { User as SupabaseUser } from "@supabase/supabase-js";
+import { createClient } from "@supabase/supabase-js";
+
+import { getPrismaClient } from "@/lib/prisma";
+import { createSupabaseAdminClient } from "@/lib/supabase/admin";
+import { createSupabaseServerClient } from "@/lib/supabase/server";
+
+import { isSocSessionValid } from "@/lib/soc-auth";
+
+export type AppRole = "USER" | "ADMIN";
+export type AppPackageTier = "FREE" | "PRO" | "PRO_MAX";
+export type AppStatus = "ACTIVE" | "PENDING" | "LOCKED";
+
+export function normaliseRole(value?: string | null): AppRole {
+  return String(value ?? "").trim().toUpperCase() === "ADMIN" ? "ADMIN" : "USER";
+}
+
+export function normalisePackageTier(value?: string | null): AppPackageTier {
+  const upper = String(value ?? "").trim().toUpperCase();
+  if (upper === "PRO_MAX") return "PRO_MAX";
+  if (upper === "PRO") return "PRO";
+  return "FREE";
+}
+
+export function normaliseStatus(value?: string | null): AppStatus {
+  const upper = String(value ?? "").trim().toUpperCase();
+  if (upper === "LOCKED") return "LOCKED";
+  if (upper === "PENDING") return "PENDING";
+  return "ACTIVE";
+}
+
+/**
+ * Daily Web Scan Limit per Package Tier:
+ * - FREE: 2 web scans / day
+ * - PRO: Unlimited (999,999) web scans / day
+ * - PRO_MAX: Unlimited (999,999) web scans / day
+ *
+ * NOTE: Daily STRESS TEST quotas are authoritatively governed by backend Redis
+ * (FREE: 0/locked, PRO: 1/day, PRO_MAX: 10/day) and CANNOT be overridden by this field.
+ */
+export function getDailyLimitForPackage(packageTier: AppPackageTier) {
+  if (packageTier === "PRO" || packageTier === "PRO_MAX") return 999999;
+  return 2;
+}
+
+/**
+ * Canonical Redeem Code Normalizer
+ *
+ * 1. Trim leading/trailing whitespace, newlines, carriage returns, tabs
+ * 2. Convert to uppercase
+ * 3. Remove all non-alphanumeric characters (spaces, hyphens, underscores, dots, etc.)
+ */
+export function normalizeRedeemCode(rawCode: string | null | undefined): string {
+  if (!rawCode) return "";
+  return String(rawCode)
+    .trim()
+    .toUpperCase()
+    .replace(/[\r\n\t\s\-_.]+/g, "");
+}
+
+
+export function toUserRecord(row: any, authUser?: SupabaseUser | null) {
+  const isPlanExpired = row.planExpiresAt
+    ? new Date(row.planExpiresAt).getTime() <= Date.now()
+    : false;
+  const effectiveTier: AppPackageTier = isPlanExpired
+    ? "FREE"
+    : normalisePackageTier(row.packageTier);
+
+  const avatar =
+    (authUser?.user_metadata ?? {})["avatar_url"] ||
+    (authUser?.user_metadata ?? {})["picture"] ||
+    (authUser?.user_metadata ?? {})["avatar"] ||
+    (authUser?.user_metadata ?? {})["avatarUrl"] ||
+    (row.avatar as string | undefined) ||
+    undefined;
+
+  return {
+    id: row.authUserId ? String(row.authUserId) : String(row.id),
+    dbId: String(row.id),
+    authUserId: row.authUserId ? String(row.authUserId) : null,
+    name: row.name ?? row.email?.split("@")[0] ?? "Người dùng",
+    email: String(row.email ?? ""),
+    avatar,
+    role: normaliseRole(row.role),
+    packageTier: effectiveTier,
+    status: normaliseStatus(row.status),
+    dailyLimit: Number(row.dailyLimit ?? getDailyLimitForPackage(effectiveTier)),
+    scansToday: Number(row.scansToday ?? 0),
+    telegramConnected: Boolean(row.telegramConnected),
+    planExpiresAt: row.planExpiresAt ? new Date(row.planExpiresAt).toISOString() : null,
+    oauthProvider: row.oauthProvider === "google" ? "google" : null,
+    lastLoginAt: row.lastLoginAt ? new Date(row.lastLoginAt).toISOString() : new Date().toISOString(),
+  };
+}
+
+export function toRedeemCodeRecord(row: any) {
+  const status = row.status === "USED" ? "USED" : row.status === "PARTIAL" ? "PARTIAL" : "UNUSED";
+  return {
+    id: String(row.id),
+    code: String(row.code),
+    packageTier: normalisePackageTier(row.packageTier),
+    durationLabel: String(row.durationLabel),
+    maxUses: Number(row.maxUses ?? 1),
+    usedCount: Number(row.usedCount ?? 0),
+    status,
+    activatedBy: row.activatedBy ? String(row.activatedBy) : null,
+    createdAt: new Date(row.createdAt).toISOString(),
+  };
+}
+
+export async function getAuthenticatedUserFromRequest(request: Request): Promise<SupabaseUser | null> {
+  try {
+    const supabase = await createSupabaseServerClient();
+    const { data: { user }, error } = await supabase.auth.getUser();
+    if (!error && user) return user;
+  } catch {}
+
+  const authHeader = request.headers.get("authorization") || request.headers.get("Authorization");
+  if (authHeader?.startsWith("Bearer ")) {
+    const token = authHeader.split(" ")[1];
+    const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
+    const anonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+    if (url && anonKey && token) {
+      try {
+        const client = createClient(url, anonKey, { auth: { persistSession: false } });
+        const { data: { user }, error } = await client.auth.getUser(token);
+        if (!error && user) return user;
+      } catch {}
+    }
+  }
+  return null;
+}
+
+export async function requireAdminRequest() {
+  /*
+   * SOC realm authentication.
+   *
+   * adq-soc.click không phụ thuộc Supabase user session.
+   */
+  if (await isSocSessionValid()) {
+    return {
+      id: "soc-root",
+      aud: "authenticated",
+      email: "soc-root@internal.adq",
+      created_at: new Date(0).toISOString(),
+      user_metadata: {
+        role: "ADMIN",
+        authRealm: "SOC",
+      },
+      app_metadata: {
+        role: "ADMIN",
+        authRealm: "SOC",
+      },
+    } as SupabaseUser;
+  }
+
+  /*
+   * Compatibility fallback:
+   * giữ hỗ trợ tài khoản Supabase ADMIN hiện có.
+   *
+   * Có thể bỏ fallback này sau khi SOC migration hoàn tất.
+   */
+  const supabase = await createSupabaseServerClient();
+
+  const { data, error } =
+    await supabase.auth.getUser();
+
+  if (error || !data.user) {
+    throw new Error("UNAUTHORIZED");
+  }
+
+  const role = normaliseRole(
+    data.user.user_metadata?.role ??
+      (
+        data.user.app_metadata as
+          | Record<string, unknown>
+          | undefined
+      )?.role,
+  );
+
+  if (role !== "ADMIN") {
+    throw new Error("FORBIDDEN");
+  }
+
+  return data.user;
+}
+
+export async function getCurrentRequestUser() {
+  const supabase = await createSupabaseServerClient();
+  const { data, error } = await supabase.auth.getUser();
+  if (error || !data.user) {
+    return null;
+  }
+  return data.user;
+}
+
+export async function listAllSupabaseAuthUsers() {
+  const admin = createSupabaseAdminClient();
+  const users: SupabaseUser[] = [];
+  let page = 1;
+  const perPage = 200;
+
+  while (true) {
+    const { data, error } = await admin.auth.admin.listUsers({ page, perPage });
+    if (error) throw new Error(error.message);
+    const batch = data?.users ?? [];
+    users.push(...batch);
+    if (batch.length < perPage || page > 50) break;
+    page += 1;
+  }
+  return users;
+}
+
+export async function findSupabaseAuthUserByEmail(email: string) {
+  const normalisedEmail = email.trim().toLowerCase();
+  if (!normalisedEmail) return null;
+  const users = await listAllSupabaseAuthUsers();
+  return users.find((user) => (user.email ?? "").trim().toLowerCase() === normalisedEmail) ?? null;
+}
+
+export async function getSupabaseAuthUserById(userId: string) {
+  const admin = createSupabaseAdminClient();
+  const { data, error } = await admin.auth.admin.getUserById(userId);
+  if (error) return null;
+  return data.user ?? null;
+}
+
+export async function resolveSupabaseAuthUser(record: { authUserId?: string | null; email: string }) {
+  if (record.authUserId) {
+    const userById = await getSupabaseAuthUserById(record.authUserId);
+    if (userById) return userById;
+  }
+  return findSupabaseAuthUserByEmail(record.email);
+}
+
+export async function syncAdminUserFromAuthUser(authUser: SupabaseUser, fallback?: Partial<any>) {
+  const prisma = getPrismaClient();
+  const email = (authUser.email ?? fallback?.email ?? "").trim().toLowerCase();
+  if (!email) {
+    throw new Error("Auth user không có email hợp lệ.");
+  }
+
+  const existing = await prisma.adminUser.findFirst({
+    where: {
+      OR: [{ authUserId: authUser.id }, { email }],
+    },
+  });
+
+  const role = normaliseRole(
+    fallback?.role ??
+      existing?.role ??
+      authUser.user_metadata?.role ??
+      (authUser.app_metadata as Record<string, unknown> | undefined)?.role,
+  );
+
+  // 1. Kiểm tra expiry của existing admin_user
+  const isExistingExpired = existing?.planExpiresAt
+    ? new Date(existing.planExpiresAt).getTime() <= Date.now()
+    : false;
+
+  const existingTier: AppPackageTier = existing
+    ? (isExistingExpired ? "FREE" : normalisePackageTier(existing.packageTier))
+    : "FREE";
+
+  // 2. Tra cứu lịch sử redeem code bền vững từ bảng redeem_code_redemptions
+  const activeRedemption = await prisma.redeemCodeRedemption.findFirst({
+    where: {
+      OR: [
+        { userAuthId: authUser.id },
+        { userEmail: email },
+      ],
+    },
+    include: { redeemCode: true },
+    orderBy: { createdAt: "desc" },
+  });
+
+  let redemptionTier: AppPackageTier = "FREE";
+  let redemptionExpiresAt: Date | null = null;
+
+  if (activeRedemption?.redeemCode) {
+    const rawTier = normalisePackageTier(activeRedemption.redeemCode.packageTier);
+    if (rawTier === "PRO" || rawTier === "PRO_MAX") {
+      const durationDays = activeRedemption.redeemCode.durationDays;
+      if (durationDays) {
+        redemptionExpiresAt = new Date(
+          new Date(activeRedemption.createdAt).getTime() + durationDays * 86400000
+        );
+      }
+      const isRedemptionExpired = redemptionExpiresAt
+        ? redemptionExpiresAt.getTime() <= Date.now()
+        : false;
+
+      if (!isRedemptionExpired) {
+        redemptionTier = rawTier;
+      }
+    }
+  }
+
+  // 3. Quyết định canonical packageTier và planExpiresAt:
+  // - Nếu có fallbackTier từ explicit admin update -> dùng fallbackTier
+  // - Nếu DB hoặc Redemption có PRO_MAX -> giữ PRO_MAX
+  // - Nếu DB hoặc Redemption có PRO -> giữ PRO
+  // - Ngược lại: FREE
+  let packageTier: AppPackageTier = "FREE";
+  let planExpiresAt: Date | null = null;
+
+  if (fallback?.packageTier) {
+    packageTier = normalisePackageTier(fallback.packageTier);
+    planExpiresAt = fallback?.planExpiresAt !== undefined
+      ? (fallback.planExpiresAt as Date | null)
+      : (existing?.planExpiresAt ?? redemptionExpiresAt);
+  } else if (existingTier === "PRO_MAX" || redemptionTier === "PRO_MAX") {
+    packageTier = "PRO_MAX";
+    planExpiresAt = existing?.planExpiresAt && !isExistingExpired
+      ? existing.planExpiresAt
+      : redemptionExpiresAt;
+  } else if (existingTier === "PRO" || redemptionTier === "PRO") {
+    packageTier = "PRO";
+    planExpiresAt = existing?.planExpiresAt && !isExistingExpired
+      ? existing.planExpiresAt
+      : redemptionExpiresAt;
+  } else {
+    packageTier = "FREE";
+    planExpiresAt = null;
+  }
+
+  if (planExpiresAt && planExpiresAt.getTime() <= Date.now()) {
+    packageTier = "FREE";
+    planExpiresAt = null;
+  }
+
+  const authProvider =
+    String(
+      (authUser.app_metadata as Record<string, unknown> | undefined)?.provider ??
+      authUser.identities?.[0]?.provider ??
+      ""
+    ).toLowerCase() === "google"
+      ? "google"
+      : null;
+
+  const status = normaliseStatus(fallback?.status ?? existing?.status ?? "ACTIVE");
+
+  const metadataName =
+    (authUser.user_metadata?.name as string | undefined)?.trim() ||
+    (authUser.user_metadata?.full_name as string | undefined)?.trim();
+
+  const name =
+    (fallback?.name as string | undefined)?.trim() ||
+    metadataName ||
+    existing?.name ||
+    authUser.email?.split("@")[0] ||
+    "Người dùng";
+
+  let savedRecord;
+
+  if (existing) {
+    savedRecord = await prisma.adminUser.update({
+      where: { id: existing.id },
+      data: {
+        authUserId: authUser.id,
+        email,
+        name,
+        role,
+        packageTier,
+        status,
+        dailyLimit: Number(
+          fallback?.dailyLimit ??
+          getDailyLimitForPackage(packageTier)
+        ),
+        scansToday: Number(fallback?.scansToday ?? existing.scansToday ?? 0),
+        telegramConnected: Boolean(fallback?.telegramConnected ?? existing.telegramConnected ?? false),
+        oauthProvider: authProvider,
+        planExpiresAt,
+        lastLoginAt: authUser.last_sign_in_at ? new Date(authUser.last_sign_in_at) : existing.lastLoginAt ?? new Date(),
+      },
+    });
+  } else {
+    savedRecord = await prisma.adminUser.create({
+      data: {
+        authUserId: authUser.id,
+        email,
+        name,
+        role,
+        packageTier,
+        status,
+        dailyLimit: Number(
+          fallback?.dailyLimit ??
+          getDailyLimitForPackage(packageTier)
+        ),
+        scansToday: Number(fallback?.scansToday ?? 0),
+        telegramConnected: Boolean(fallback?.telegramConnected ?? false),
+        oauthProvider: authProvider,
+        planExpiresAt,
+        lastLoginAt: authUser.last_sign_in_at ? new Date(authUser.last_sign_in_at) : new Date(),
+      },
+    });
+  }
+
+  // Best-effort async synchronization to Supabase Auth metadata
+  if (
+    authUser.id &&
+    (
+      (authUser.app_metadata as any)?.packageTier !== packageTier ||
+      authUser.user_metadata?.packageTier !== packageTier ||
+      (authUser.app_metadata as any)?.planExpiresAt !== (planExpiresAt ? planExpiresAt.toISOString() : null)
+    )
+  ) {
+    syncSupabaseMetadataForAdminUser({
+      authUserId: authUser.id,
+      name,
+      role,
+      packageTier,
+      status,
+      planExpiresAt: planExpiresAt ? planExpiresAt.toISOString() : null,
+    }).catch(() => {});
+  }
+
+  return savedRecord;
+}
+
+export async function syncAllAuthUsersIntoAdminUsers() {
+  const users = await listAllSupabaseAuthUsers();
+  for (const authUser of users) {
+    if (!authUser.email) continue;
+    await syncAdminUserFromAuthUser(authUser);
+  }
+}
+
+export async function syncSupabaseMetadataForAdminUser(input: {
+  authUserId: string;
+  name?: string | null;
+  role: AppRole;
+  packageTier: AppPackageTier;
+  status?: AppStatus;
+  planExpiresAt?: string | null;
+  password?: string;
+}) {
+  try {
+    const admin = createSupabaseAdminClient();
+    const existing = await admin.auth.admin.getUserById(input.authUserId);
+    if (!existing.data.user) return;
+
+    await admin.auth.admin.updateUserById(input.authUserId, {
+      user_metadata: {
+        ...(existing.data.user.user_metadata ?? {}),
+        ...(input.name ? { name: input.name, full_name: input.name } : {}),
+        role: input.role,
+        packageTier: input.packageTier,
+        status: input.status ?? "ACTIVE",
+        planExpiresAt: input.planExpiresAt ?? null,
+      },
+      app_metadata: {
+        ...(existing.data.user.app_metadata ?? {}),
+        role: input.role,
+        packageTier: input.packageTier,
+        status: input.status ?? "ACTIVE",
+        planExpiresAt: input.planExpiresAt ?? null,
+      },
+    });
+  } catch (err) {}
+}
+
+export function parseDurationLabelToDays(durationLabel: string) {
+  const raw = durationLabel.trim().toLowerCase();
+  if (!raw) return null;
+  if (raw.includes("vĩnh viễn") || raw.includes("permanent") || raw.includes("forever") || raw.includes("lifetime")) {
+    return null;
+  }
+  const match = raw.match(/(\d+)/);
+  if (!match) return null;
+  const value = Number(match[1]);
+  if (Number.isNaN(value) || value <= 0) return null;
+  if (raw.includes("năm") || raw.includes("year")) return value * 365;
+  if (raw.includes("tháng") || raw.includes("month")) return value * 30;
+  if (raw.includes("tuần") || raw.includes("week")) return value * 7;
+  return value;
+}
+
+export function computePlanExpiry(durationDays: number | null, from = new Date()) {
+  if (durationDays === null) return null;
+  const days = durationDays && durationDays > 0 ? durationDays : 365;
+  const expiry = new Date(from);
+  expiry.setDate(expiry.getDate() + days);
+  return expiry;
+}
+
+export function createRandomPassword(length = 12) {
+  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%^&*";
+  let password = "";
+  for (let index = 0; index < length; index += 1) {
+    password += alphabet[Math.floor(Math.random() * alphabet.length)];
+  }
+  return password;
+}

@@ -1,0 +1,179 @@
+services:
+  caddy:
+    image: caddy:2-alpine
+    container_name: adq_caddy
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - api-server
+      - web-dashboard
+    networks:
+      - adq_net
+
+  db:
+    image: postgres:15-alpine
+    container_name: adq_postgres
+    restart: always
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: adq_secure_password
+      POSTGRES_DB: adq_db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - adq_net
+
+  redis:
+    image: redis:7-alpine
+    container_name: adq_redis
+    restart: always
+    volumes:
+      - redis_data:/data
+    networks:
+      - adq_net
+
+  oast-server:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.backend
+    container_name: adq_oast
+    restart: always
+    command: python3 runtime_services.py --role oast --host 0.0.0.0 --port 8888
+    networks:
+      - adq_net
+
+  host-telemetry:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.host-telemetry
+    container_name: adq_host_telemetry
+    restart: always
+    command: uvicorn host_telemetry:app --host 0.0.0.0 --port 9100
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/host/root:ro
+    networks:
+      - adq_net
+
+  api-server:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.backend
+    container_name: adq_api
+    restart: always
+    command: uvicorn api_server:app --host 0.0.0.0 --port 8000
+    env_file:
+      - .env
+    volumes:
+      - apk_spool_data:/tmp/adq_apk_spool
+    depends_on:
+      - db
+      - redis
+      - host-telemetry
+    networks:
+      - adq_net
+
+  master-node:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.backend
+    container_name: adq_master
+    restart: always
+    command: python3 runtime_services.py --role master
+    env_file:
+      - .env
+    depends_on:
+      - redis
+      - db
+    networks:
+      - adq_net
+
+  worker-light:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.backend
+    restart: always
+    command: python3 runtime_services.py --role worker --worker-id worker-light-1 --capability recon_infra,web_mapping
+    environment:
+      - WORKER_CAPABILITIES=recon_infra,web_mapping
+    env_file:
+      - .env
+    depends_on:
+      - master-node
+    networks:
+      - adq_net
+
+  worker-elite:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.backend
+    restart: always
+    command: python3 runtime_services.py --role worker --worker-id worker-elite-1 --capability dast_active,deep_logic
+    environment:
+      - WORKER_CAPABILITIES=dast_active,deep_logic
+    env_file:
+      - .env
+    depends_on:
+      - master-node
+    networks:
+      - adq_net
+
+  worker-stress:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.backend
+    container_name: adq_worker_stress
+    restart: always
+    command: python3 runtime_services.py --role worker --worker-id worker-stress-1 --capability stress_test
+    environment:
+      - WORKER_CAPABILITIES=stress_test
+    env_file:
+      - .env
+    depends_on:
+      - master-node
+      - redis
+    networks:
+      - adq_net
+
+  web-dashboard:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.web
+      args:
+        DATABASE_URL: ${DATABASE_URL}
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-https://api.adq.io.vn}
+        NEXT_PUBLIC_SITE_URL: ${NEXT_PUBLIC_SITE_URL:-https://adq.io.vn}
+        NEXT_PUBLIC_SUPABASE_URL: ${SUPABASE_URL}
+        NEXT_PUBLIC_SUPABASE_ANON_KEY: ${SUPABASE_KEY}
+    container_name: adq_dashboard
+    restart: always
+    environment:
+      - PORT=3000
+      - SOC_ADMIN_PASSWORD=${SOC_ADMIN_PASSWORD:-}
+      - ADQ_SOC_SESSION_SECRET=${ADQ_SOC_SESSION_SECRET:-}
+    env_file:
+      - .env
+    depends_on:
+      - db
+      - api-server
+    networks:
+      - adq_net
+
+networks:
+  adq_net:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  caddy_data:
+  caddy_config:
+  apk_spool_data:
+

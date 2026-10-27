@@ -1,0 +1,71 @@
+adq.io.vn {
+    @nextjs_api {
+        path \
+            /api/account \
+            /api/account/* \
+            /api/scans \
+            /api/scans/*
+    }
+
+    handle @nextjs_api {
+        reverse_proxy web-dashboard:3000
+    }
+
+    @fastapi {
+        path \
+            /api/health \
+            /api/scan \
+            /api/scan/* \
+            /api/verification \
+            /api/verification/* \
+            /api/stress \
+            /api/stress/* \
+            /api/apk-audit \
+            /api/apk-audit/* \
+            /api/maintenance \
+            /api/maintenance/* \
+            /api/copilot \
+            /api/copilot/* \
+            /api/c2 \
+            /api/c2/* \
+            /api/ctem \
+            /api/ctem/* \
+            /api/graph \
+            /api/graph/* \
+            /api/grid \
+            /api/grid/* \
+            /api/oast \
+            /api/oast/*
+    }
+
+    handle @fastapi {
+        reverse_proxy api-server:8000
+    }
+
+    handle {
+        reverse_proxy web-dashboard:3000
+    }
+}
+
+www.adq.io.vn {
+    redir https://adq.io.vn{uri} permanent
+}
+
+api.adq.io.vn {
+    reverse_proxy api-server:8000
+}
+
+adq-soc.click {
+    @root {
+        path /
+    }
+    redir @root /admin permanent
+
+    handle {
+        reverse_proxy web-dashboard:3000
+    }
+}
+
+www.adq-soc.click {
+    redir https://adq-soc.click{uri} permanent
+}
